@@ -1,0 +1,739 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=600, height=600, initial-scale=1.0, user-scalable=no">
+<title>청각 정보 공유 시스템 — LIVE v1.5 (실기기)</title>
+<!--
+  3역할 실전 프로토타입: BAR · POS · CS
+  ═══ v1.5 (2026.07.24): 실기기(Meta Ray-Ban Display) 규격 반영 ═══
+  · 뷰포트 600×600 고정 — Meta Web Apps Display 공식 규격 메타 태그
+      (POS 역할 진입 시 태블릿용 width=device-width로 전환)
+  · 진동 대체 — 안경 웹앱은 navigator.vibrate 미지원 가능성 → 시각 펄스 링으로 대체
+      위계 유지: 비상=강한 링 5회 / 안전·변경=중간 3회 / 일반=약한 1회
+  · 역할·방 localStorage 저장 — 재실행 시 마지막 역할에 초점 (안경에선 URL 파라미터 입력 불가)
+  · 실기기 진단 화면 신설 — 시작 화면 '진단' 버튼:
+      MQTT 외부 네트워크 허용 여부(7/24 당일 확인 항목) · 마지막 키 입력 · 진동 API ·
+      저장소 · 화면 크기(기대값 600×600) · 펄스 테스트
+  · 안경 웹앱 미지원 확인(공식 문서): 마이크·카메라·알림·텍스트 입력·오프라인
+      → 안전 귀(Web Speech)는 종전대로 POS 태블릿 전용
+  ── 이하 v1.4와 동일 ──
+  · HUB 판단 5종: ①변환 ②분류 ③모드 ④위계 ⑤라우팅 + 게이트
+  · 어휘: PC-1/2/3 (POS→CS), CP-1 (CS→POS) — 보드 16번 섹션 어휘 세트
+  · BAR·CS = 600×600 D패드(안경 규격), POS = 태블릿 터치
+  · M = 모의 기기 모드(데스크톱 전용), G = 흘낏 봄, A = 초점 감사
+  · 통신: 공개 MQTT(wss) + 같은 기기 탭 간 BroadcastChannel · ?room=이름&role=bar|pos|cs
+  · 공식 검증 기준: "화살표+Enter로 작동하면 안경에서도 작동한다" (Meta Web Apps Build 가이드)
+-->
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5/dist/mqtt.min.js"></script>
+<style>
+  :root{
+    --hud-bg:#0A0D10; --hud-frame:#2A2F36;
+    --tx:#F2F5F7; --sub:#B4BCC5; --dim:#78828C; --faint:#59626B;
+    --ok:#6EE7A8; --ok-deep:#3D6B52; --warn:#FFC24D; --warn-deep:#8A6520;
+    --paper:#EDEFF2; --ink:#22272C; --ink-soft:#5C666F; --line:#C9CED4;
+    --mono:ui-monospace,'SF Mono','Consolas',monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Apple SD Gothic Neo','Pretendard','Noto Sans KR','Malgun Gothic',sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#000;color:var(--tx);font-family:var(--sans);min-height:100vh;
+    display:flex;align-items:center;justify-content:center;overflow:hidden}
+  body.posmode{overflow:auto}
+
+  .stage{width:min(100vw,100vh,600px);height:min(100vw,100vh,600px);
+    background:radial-gradient(120% 120% at 50% 30%, #101418 0%, var(--hud-bg) 62%);
+    display:flex;flex-direction:column;padding:5.5%;position:relative;overflow:hidden;
+    border:2px solid #15181d}
+  .stage.alert{box-shadow:inset 0 0 0 4px var(--warn-deep)}
+
+  .pulsering{position:absolute;inset:0;pointer-events:none;z-index:50;opacity:0;
+    box-shadow:inset 0 0 0 10px rgba(255,194,77,.85);transition:opacity .1s}
+  .pulsering.on{opacity:1}
+  .pulsering.soft{box-shadow:inset 0 0 0 6px rgba(242,245,247,.55)}
+  .pulsering.hard{box-shadow:inset 0 0 0 14px rgba(255,122,92,.92)}
+
+  .top{display:flex;justify-content:space-between;align-items:center;
+    font-size:clamp(11px,2.3vmin,14px);color:var(--dim);min-height:1.5em;gap:8px}
+  .tag-ok{color:var(--ok)}.tag-warn{color:var(--warn);font-weight:600}
+  .chip{font-size:clamp(10px,2vmin,12px);border:1px solid var(--hud-frame);border-radius:999px;padding:2px 10px;color:var(--sub)}
+  .chip.rush{border-color:var(--warn-deep);color:var(--warn)}
+
+  .mid{flex:1;display:flex;flex-direction:column;justify-content:center;gap:2.4%}
+  .t1{font-size:clamp(20px,5.4vmin,32px);font-weight:600;line-height:1.28}
+  .t2{font-size:clamp(13px,3.2vmin,19px);color:var(--sub)}
+  .t3{font-size:clamp(11px,2.4vmin,14px);color:var(--faint)}
+  .okline{color:var(--ok);font-size:clamp(12px,2.8vmin,16px)}
+  .loc{color:var(--ok);font-size:clamp(13px,3vmin,18px)}
+  .strike{color:var(--faint);text-decoration:line-through;font-size:clamp(15px,3.6vmin,22px)}
+  .diff{color:var(--warn);font-size:clamp(20px,5.4vmin,32px);font-weight:600}
+
+  .fbtn{border:1px solid #3A424C;border-radius:12px;background:#171B20;color:var(--dim);
+    padding:2.6% 4%;font-size:clamp(12px,2.9vmin,16px);font-family:var(--sans);cursor:pointer;text-align:center}
+  .fbtn.focus{border-color:var(--ok);color:var(--tx);background:#16211C;outline:none}
+  .stage.alert .fbtn.focus{border-color:var(--warn)}
+  .btnrow{display:flex;gap:2.6%;margin-top:2.6%;flex-wrap:wrap}
+  .btnrow .fbtn{flex:1;min-width:28%}
+
+  .foot{border-top:1px solid #23282F;padding-top:2.8%;text-align:center;
+    font-size:clamp(10px,2.3vmin,13px);color:var(--dim);min-height:2.4em}
+  .g{color:var(--ok)}.stage.alert .g{color:var(--warn)}
+
+  /* ── POS(태블릿) ── */
+  .pos{width:min(100vw,800px);min-height:100vh;background:var(--paper);color:var(--ink);
+    padding:22px 20px;display:flex;flex-direction:column;gap:14px}
+  .pos h1{font-size:17px}
+  .pos .meta{font-family:var(--mono);font-size:11px;color:var(--ink-soft)}
+  .card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+  .card h2{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-soft);margin-bottom:10px}
+  .pbtn{display:block;width:100%;text-align:left;background:#fff;border:1px solid var(--line);
+    border-radius:12px;padding:12px 14px;font-size:15px;font-family:var(--sans);cursor:pointer;margin-bottom:8px}
+  .pbtn:active{background:#eef2f5}
+  .pbtn small{display:block;color:var(--ink-soft);font-size:12px;margin-top:2px}
+  .pbtn:disabled{opacity:.45}
+  .pbtn.urgent{border-color:#c98a2a}
+  .stgrow{display:flex;gap:6px;margin-top:8px}
+  .stg{flex:1;text-align:center;font-family:var(--mono);font-size:10.5px;padding:6px 2px;border-radius:7px;border:1px solid var(--line);color:var(--ink-soft);background:#fff}
+  .stg.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+  .stg.ok{background:#1E6B45;color:#fff;border-color:#1E6B45}
+  .stg.no{background:#8a3030;color:#fff;border-color:#8a3030}
+  .inbox{background:#fff8ec;border:1px solid #d9b06a;border-radius:10px;padding:10px 12px;margin-bottom:8px}
+  .inbox .who{font-family:var(--mono);font-size:10px;color:#8a6520;margin-bottom:3px}
+  .inbox .what{font-size:14px;font-weight:600}
+  .inbox button{margin-top:8px;background:var(--ink);color:#fff;border:none;border-radius:8px;padding:7px 14px;font-size:13px;cursor:pointer}
+  .plog{list-style:none;font-family:var(--mono);font-size:11px;color:var(--ink-soft);display:flex;flex-direction:column;gap:5px;max-height:130px;overflow-y:auto}
+  .plog li::before{content:'·';margin-right:6px}
+  .plog li.ok{color:#1E6B45}.plog li.warn{color:#8A6520}
+  .dangerOv{position:absolute;inset:0;z-index:35;display:flex;flex-direction:column;justify-content:center;align-items:center;gap:3%;padding:8%;text-align:center;background:rgba(8,7,5,.97)}
+  .dangerOv.t1{box-shadow:inset 0 0 0 6px #B3402E}
+  .dangerOv.t2{box-shadow:inset 0 0 0 5px var(--warn-deep)}
+  .dangerOv .dg1{font-size:clamp(26px,8vmin,46px);font-weight:700}
+  .dangerOv.t1 .dg1{color:#FF7A5C}
+  .dangerOv.t2 .dg1{color:var(--warn)}
+  .dangerOv .dg2{font-size:clamp(16px,4.4vmin,26px);color:var(--tx);line-height:1.35}
+  .dangerOv .dg3{font-size:clamp(11px,2.4vmin,14px);color:var(--dim)}
+  .hidden{display:none !important}
+
+  /* ── Mock Device 모드 (데스크톱 전용) ── */
+  body.mockon{background:radial-gradient(130% 110% at 50% 105%, #2b241e 0%, #171310 55%, #0b0908 100%)}
+  #mockBadge{display:none;position:fixed;top:10px;left:12px;z-index:60;font-family:var(--mono);font-size:11px;color:var(--warn);border:1px solid var(--warn-deep);border-radius:8px;padding:3px 10px;background:rgba(18,14,9,.85)}
+  body.mockon #mockBadge{display:block}
+  #mockHelp{display:none;position:fixed;bottom:12px;left:50%;transform:translateX(-50%);z-index:60;font-family:var(--mono);font-size:11px;color:#a89d8d;background:rgba(18,14,9,.8);border-radius:8px;padding:4px 12px;white-space:nowrap}
+  body.mockon #mockHelp{display:block}
+  #mockToast{position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:70;font-size:13px;color:var(--warn);background:rgba(20,16,10,.92);border:1px solid var(--warn-deep);border-radius:10px;padding:7px 14px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90vw;text-align:center}
+  #mockToast.show{opacity:1}
+  body.mockon .stage.glass{position:fixed;top:7vh;right:5vw;left:auto;transform-origin:top right;transform:scale(.45);filter:brightness(.5) saturate(.85);transition:transform .22s ease,filter .22s ease,top .22s ease,right .22s ease;z-index:40}
+  body.mockon.glance .stage.glass{top:50%;right:50%;transform-origin:top right;transform:translate(50%,-50%) scale(.94);filter:none}
+  body.mockon .stage.glass *{pointer-events:none}
+</style>
+</head>
+<body>
+<div id="mockBadge">MOCK DEVICE · 단안 시뮬레이션</div>
+<div id="mockHelp">G 누르고 있기 = 흘낏 봄 · A = 초점 감사 · M = 해제</div>
+<div id="mockToast"></div>
+
+<!-- 시작: 역할 선택 -->
+<div class="stage" id="startView">
+  <div class="top"><span>청각 정보 공유 시스템 v1.5</span><span class="chip" id="startConn">연결 중…</span></div>
+  <div class="mid">
+    <p class="t1">역할을 선택하세요</p>
+    <p class="t3" id="roomLine"></p>
+    <div class="btnrow">
+      <button class="fbtn" data-r="bar">BAR · 안경</button>
+      <button class="fbtn" data-r="pos">POS · 태블릿</button>
+      <button class="fbtn" data-r="cs">CS · 안경</button>
+      <button class="fbtn" data-r="diag">진단 · 실기기</button>
+    </div>
+  </div>
+  <div class="foot">스와이프(←→) = 이동 · <span class="g">핀치(Enter) = 선택</span></div>
+</div>
+
+<!-- 진단 (실기기 체크) -->
+<div class="stage hidden" id="diagView">
+  <div class="top"><span>실기기 진단 · 7/24</span><span class="chip" id="dConn">…</span></div>
+  <div class="mid" id="dMid" style="justify-content:flex-start;gap:2%"></div>
+  <div class="foot">스와이프=이동 · <span class="g">핀치=선택</span></div>
+  <div class="pulsering" id="dPulseRing"></div>
+</div>
+
+<!-- BAR (안경) -->
+<div class="stage glass hidden" id="barView">
+  <div class="top">
+    <span id="bTopL">대기</span>
+    <span style="display:flex;gap:8px;align-items:center">
+      <span class="chip" id="bDefer" style="display:none"></span>
+      <span class="chip" id="bMode">여유·숄더</span>
+      <span class="chip">BAR</span><span class="chip" id="bConn">…</span>
+    </span>
+  </div>
+  <div class="mid" id="bMid"></div>
+  <div class="foot" id="bFoot"></div>
+  <div class="dangerOv hidden" id="bDangerOv"></div>
+  <div class="pulsering" id="bPulse"></div>
+</div>
+
+<!-- CS (안경) -->
+<div class="stage glass hidden" id="csView">
+  <div class="top">
+    <span id="cTopL">순회 중</span>
+    <span style="display:flex;gap:8px;align-items:center">
+      <span class="chip" id="cMode">여유·숄더</span>
+      <span class="chip">CS</span><span class="chip" id="cConn">…</span>
+    </span>
+  </div>
+  <div class="mid" id="cMid"></div>
+  <div class="foot" id="cFoot"></div>
+  <div class="dangerOv hidden" id="cDangerOv"></div>
+  <div class="pulsering" id="cPulse"></div>
+</div>
+
+<!-- POS (태블릿) -->
+<div class="pos hidden" id="posView">
+  <div>
+    <h1>POS · 민지 측 (태블릿)</h1>
+    <p class="meta" id="pMeta"></p>
+    <p class="meta" id="pMode">모드: 여유·숄더</p>
+  </div>
+  <div class="card">
+    <h2>BAR에 보내기 — 라우팅 자동 (허브 ⑤)</h2>
+    <button class="pbtn" id="pOrder">① 주문 #127 <small>아이스 라떼 · 톨 · 샷 추가 — 허브가 주문 유입 감지 → 러시 전환 제안</small></button>
+    <button class="pbtn" id="pChange" disabled>② 변경: 우유 → 오트 <small>급함 통과(허브 ②·④) · 강한 진동 2회 · 더블 핀치 확인</small></button>
+    <button class="pbtn" id="pChat">③ 잡담 <small>"아까 진짜 잘했어" — 러시 중이면 허브 게이트가 자동 보류</small></button>
+  </div>
+  <div class="card">
+    <h2>CS에 보내기 — PC 어휘 (보드 16) · rush일수록 급함 → 항상 통과</h2>
+    <button class="pbtn" id="pPC1">PC-1 · 3번 테이블 정리 부탁 <small>위치 포함 · 진동 1회</small></button>
+    <button class="pbtn urgent" id="pPC2">PC-2 · 입구 음료 쏟음 — 미끄럼 주의 <small>안전 위계(허브 ④) · 강한 진동 2회</small></button>
+    <button class="pbtn" id="pPC3">PC-3 · 라이더 도착 — 픽업대 응대 <small>진동 1회</small></button>
+  </div>
+  <div class="card">
+    <h2>안전 귀 — 위험 발화 감지 (보드 17) · 허브 ①+②+④ 연쇄 · POS 태블릿 전용(안경 웹앱 마이크 미지원)</h2>
+    <button class="pbtn" id="pEar">🎤 위험 발화 감지 켜기 <small id="pEarSt">꺼짐 — 크롬에서 마이크 허용 후 "뜨거운 물 지나갑니다"라고 말해보세요</small></button>
+    <p class="meta" id="pHeard" style="min-height:1.2em"></p>
+  </div>
+  <div class="card">
+    <h2>수신함 (CS의 보고) — rush 중엔 허브가 보류</h2>
+    <div id="pInbox"><p class="empty" style="font-size:13px;color:var(--ink-soft)">도착한 보고 없음</p></div>
+  </div>
+  <div class="card">
+    <h2>상태 — 소통의 순환 구조</h2>
+    <div id="pStatus"><p style="font-size:13px;color:var(--ink-soft)">아직 보낸 것 없음</p></div>
+  </div>
+  <div class="card"><h2>로그</h2><ul class="plog" id="pLog"></ul></div>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════
+   허브의 판단 5종 — 총정리 12번 구조도의 코드화
+   "모든 정보가 여기서 판단된다" — 콘텐츠 메시지는 발신 시
+   send()가, 수신 시 각 역할의 receive가 반드시 HUB를 거친다.
+   ═══════════════════════════════════════════════════════════ */
+const HUB={
+  /* ① 변환: 음성 → 텍스트. 현재 유일한 음성 입력원은 안전 귀(Web Speech, POS 전용).
+     8월 자체 STT 통합 시 이 함수가 교체 지점이 된다. */
+  transform(raw){ return { text:(raw||'').trim() }; },
+
+  /* ② 분류: 메시지 종류 → 급함 클래스.
+     시스템이 종류로 기본 분류하고, 발신자는 escalate로만 승격(2026.07 확정). */
+  KLASS:{ order:'task', change:'change', chat:'chat',
+          pc1:'task', pc2:'safety', pc3:'task', cp1:'report', danger:'emergency' },
+  classify(t,opts={}){
+    let k=this.KLASS[t]||'task';
+    if(t==='danger'&&opts.tier===2)k='safety';   // 2단(주의)은 안전 위계로
+    if(opts.escalate&&k==='chat')k='task';        // 발신자 긴급 승격
+    return k;
+  },
+
+  /* ③ 모드: rush / shoulder / usual — 팀 공유 상태.
+     전환은 하이브리드: 시스템이 제안(modeProposal), 사람이 핀치로 확정(modeSet). */
+  mode:'shoulder',
+
+  /* ④ 위계: 비상 > 변경·안전 > 일반 > 잡담.
+     진동(실기기에선 시각 펄스) 패턴과 표시 강도는 오직 여기서 나온다. */
+  HIER:{ emergency:{rank:0, vib:[250,120,250,120,250], fullscreen:true },
+         safety:   {rank:1, vib:[120,80,120],          alert:true },
+         change:   {rank:1, vib:[120,80,120],          alert:true },
+         task:     {rank:2, vib:[80] },
+         report:   {rank:2, vib:[80] },
+         chat:     {rank:3, vib:[80] } },
+  hierarchy(k){ return this.HIER[k]||this.HIER.task; },
+
+  /* ⑤ 라우팅: 내용이 수신자를 함의 — 역할 주소. 발신자는 수신자를 고르지 않는다. */
+  ROUTE:{ order:'bar', change:'bar', chat:'bar',
+          pc1:'cs', pc2:'cs', pc3:'cs', cp1:'pos',
+          seen:'pos', accept:'pos', ack:'pos', done:'pos', reply:'pos', deferNote:'pos',
+          csSeen:'pos', csAccept:'pos', csDecline:'pos', csHold:'pos', csDone:'pos',
+          cpReceipt:'cs', modeProposal:'all', modeSet:'all', danger:'all' },
+  route(t){ return this.ROUTE[t]||'all'; },
+
+  /* 게이트: ②분류 + ③모드의 종합 판정 — 통과/보류.
+     보류 규칙은 소통 선의 방향을 참조한다(2026.07 확정):
+     · 잡담: rush 중(또는 수신자 과업 중) 보류 → 여유 시간에 도착
+     · CS→POS 보고(report): rush 중 보류 가능
+     · POS→CS 과업 지시·변경·안전·비상: rush일수록 급함 → 항상 통과 */
+  gate(klass,{busy=false}={}){
+    if(klass==='chat')   return (this.mode==='rush'||busy)?'defer':'pass';
+    if(klass==='report') return this.mode==='rush'?'defer':'pass';
+    return 'pass';
+  }
+};
+function modeLabel(m){ return m==='rush'?'러시':(m==='usual'?'여유·평시':'여유·숄더'); }
+let heldReports=[]; // POS: rush 중 허브가 보류한 CS 보고
+
+/* ═══ 저장소 (실기기: 역할·방 기억 — 안경에선 URL 입력 불가) ═══ */
+function lsGet(k){try{return localStorage.getItem(k);}catch(e){return null;}}
+function lsSet(k,v){try{localStorage.setItem(k,v);return true;}catch(e){return false;}}
+
+/* ═══ 방·역할·통신 ═══ */
+const qs=new URLSearchParams(location.search);
+const ROOM=(qs.get('room')||lsGet('hud_room')||'cafe127').replace(/[^a-zA-Z0-9_-]/g,'');
+lsSet('hud_room',ROOM);
+const TOPIC='yonsei-shim-hud/'+ROOM;
+document.getElementById('roomLine').textContent='방: '+ROOM+' — 주소 뒤 ?room=이름 · 마지막 역할 기억';
+let myRole=qs.get('role')||null;
+const myId=Math.random().toString(36).slice(2,8);
+const seen=new Set();
+const bc=('BroadcastChannel' in window)?new BroadcastChannel('hud-'+ROOM):null;
+if(bc)bc.onmessage=e=>receive(e.data);
+let mq=null,mqOK=false;
+function setConn(txt,good){
+  for(const id of ['startConn','bConn','cConn','dConn']){const el=document.getElementById(id);if(el){el.textContent=txt;el.style.color=good?'var(--ok)':'var(--dim)';}}
+  document.getElementById('pMeta').textContent='방 '+ROOM+' · '+txt;
+}
+try{
+  if(typeof mqtt!=='undefined'){
+    mq=mqtt.connect('wss://broker.emqx.io:8084/mqtt',{clientId:'hud_'+myId,clean:true,connectTimeout:6000,reconnectPeriod:4000});
+    mq.on('connect',()=>{mqOK=true;setConn('온라인',true);mq.subscribe(TOPIC);});
+    mq.on('message',(t,p)=>{try{receive(JSON.parse(p.toString()));}catch(e){}});
+    mq.on('offline',()=>{mqOK=false;setConn(bc?'로컬(탭 간)':'오프라인',false);});
+    mq.on('error',()=>{});
+  }else setConn(bc?'로컬(탭 간)':'통신 불가',false);
+}catch(e){setConn('로컬(탭 간)',false);}
+setTimeout(()=>{if(!mqOK)setConn(bc?'로컬(탭 간)':'연결 지연…',false);},7000);
+
+function send(msg){
+  msg.to=msg.to||HUB.route(msg.t);                                   // 허브 ⑤ 라우팅
+  if(HUB.KLASS[msg.t])msg.klass=msg.klass||HUB.classify(msg.t,msg);  // 허브 ② 분류
+  msg.mid=myId+'-'+Math.random().toString(36).slice(2,7);
+  msg.from=myId;msg.fromRole=myRole;
+  if(mqOK)mq.publish(TOPIC,JSON.stringify(msg));
+  if(bc)bc.postMessage(msg);
+}
+function receive(m){
+  if(!m||!m.mid||m.from===myId||seen.has(m.mid))return;
+  seen.add(m.mid);
+  if(m.to!=='all'&&m.to!==myRole)return; // 역할 주소 필터
+  if(m.t==='modeSet'){setMode(m.mode,false);return;}                 // 허브 ③ 공유 상태 동기화
+  if(m.t==='modeProposal'){if(myRole==='bar')barProposal(m.mode);return;}
+  if(m.t==='danger'){onDanger(m);return;}                            // 허브 ④ 최상위 — 게이트 없음
+  if(myRole==='bar')barReceive(m);
+  else if(myRole==='cs')csReceive(m);
+  else if(myRole==='pos')posReceive(m);
+}
+
+/* ═══ 모드(허브 ③) 공유 상태 관리 ═══ */
+function updateModeChips(){
+  const t=modeLabel(HUB.mode), rush=HUB.mode==='rush';
+  for(const id of ['bMode','cMode']){const el=document.getElementById(id);if(el){el.textContent=t;el.classList.toggle('rush',rush);}}
+  const pm=document.getElementById('pMode');
+  if(pm)pm.textContent='모드: '+t+(heldReports.length?' · 허브 보류 보고 '+heldReports.length+'건':'');
+}
+function setMode(m,broadcast){
+  if(HUB.mode===m)return;
+  HUB.mode=m;updateModeChips();
+  if(broadcast)send({t:'modeSet',mode:m});
+  if(myRole==='pos'){plog('모드 → '+modeLabel(m),m==='rush'?'warn':'ok');if(m!=='rush')flushHeld();}
+  if(myRole==='bar'&&m!=='rush'&&bState==='waiting'&&deferred.length)barRender('deferred');
+}
+
+/* ═══ 입력 레이어: D패드 (공식: 화살표+Enter = 밴드) ═══ */
+let focusables=[],fIdx=0,lastKey='',lastKeyN=0;
+function setFocusables(l){focusables=l;fIdx=0;paint();}
+function paint(){focusables.forEach((b,i)=>b.classList.toggle('focus',i===fIdx));}
+function moveFocus(d){if(!focusables.length)return;fIdx=(fIdx+d+focusables.length)%focusables.length;paint();}
+function activate(){if(focusables[fIdx])focusables[fIdx].click();}
+const DOUBLE_MS=430;let lastAct=0,actTimer=null,dblHandler=null;
+function pinch(){
+  const now=Date.now();
+  if(now-lastAct<DOUBLE_MS){clearTimeout(actTimer);actTimer=null;lastAct=0;if(dblHandler)dblHandler();else activate();}
+  else{lastAct=now;actTimer=setTimeout(()=>{lastAct=0;activate();},dblHandler?DOUBLE_MS:0);}
+}
+
+/* ═══ Mock Device 모드 (데스크톱 전용) ═══ */
+let mock=false;
+const mockToast=document.getElementById('mockToast');
+function toast(m){mockToast.textContent=m;mockToast.classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>mockToast.classList.remove('show'),2600);}
+function setMock(on){
+  mock=on;document.body.classList.toggle('mockon',on);
+  if(!on)document.body.classList.remove('glance');
+  toast(on?'모의 기기 ON — G를 누르는 동안만 또렷이 보입니다':'모의 기기 OFF');
+}
+addEventListener('mousedown',()=>{if(mock&&(myRole==='bar'||myRole==='cs'))toast('모의 기기 — 화살표(스와이프)와 Enter(핀치)만 허용');},true);
+addEventListener('keyup',e=>{if((e.key==='g'||e.key==='G')&&mock)document.body.classList.remove('glance');});
+addEventListener('keydown',e=>{
+  lastKey=e.key;lastKeyN++;
+  const dk=document.getElementById('dKey');if(dk)dk.textContent=lastKey+' ('+lastKeyN+'회)';
+  if(e.key==='m'||e.key==='M'){if(myRole==='bar'||myRole==='cs')setMock(!mock);return;}
+  if((e.key==='g'||e.key==='G')&&mock){document.body.classList.add('glance');return;}
+  if((e.key==='a'||e.key==='A')&&mock){toast('초점 감사 — 요소 '+focusables.length+'개, 전부 스와이프+핀치로 도달 가능');return;}
+  if(e.key==='Escape'&&dangerOpen){hideDanger();e.preventDefault();return;}
+  if(e.key==='ArrowRight'||e.key==='ArrowDown'){moveFocus(1);e.preventDefault();}
+  else if(e.key==='ArrowLeft'||e.key==='ArrowUp'){moveFocus(-1);e.preventDefault();}
+  else if(e.key==='Enter'){if(dangerOpen){hideDanger();e.preventDefault();return;}pinch();e.preventDefault();}
+});
+
+/* ═══ 알림 레이어: 진동 + 시각 펄스 (실기기 대체 · 위계는 HUB ④에서만 나온다) ═══ */
+function pulseEl(el,p){
+  if(!el)return;
+  el.classList.remove('soft','hard');
+  if(p.length>=5)el.classList.add('hard');
+  else if(p.length<3)el.classList.add('soft');
+  let i=0;
+  (function step(){
+    if(i>=p.length){el.classList.remove('on');return;}
+    el.classList.toggle('on',i%2===0);
+    setTimeout(()=>{i++;step();},p[i]);
+  })();
+}
+function vib(p){
+  try{if(navigator.vibrate)navigator.vibrate(p);}catch(e){}
+  if(myRole==='bar')pulseEl(document.getElementById('bPulse'),p);
+  else if(myRole==='cs')pulseEl(document.getElementById('cPulse'),p);
+}
+
+/* ═══ 안전 귀: 위험 발화 감지 (POS 태블릿 전용 — 안경 웹앱 마이크 미지원) ═══ */
+const DANGER_T1=['위험','조심해','불이야','다쳤','살려'];
+const DANGER_T2=['뜨거','지나갑니다','지나가요','유리','깨졌','쏟았','미끄러','뒤에 있'];
+let ear=null, earOn=false, dangerOpen=false, dangerTimer=null;
+const lastFire={1:0,2:0};
+function matchDanger(t){
+  for(const k of DANGER_T1)if(t.includes(k))return 1;
+  for(const k of DANGER_T2)if(t.includes(k))return 2;
+  return 0;
+}
+function fireDanger(tier,heard){
+  const now=Date.now();
+  if(now-lastFire[tier]<4000)return;
+  lastFire[tier]=now;
+  send({t:'danger',tier,heard});   // send()에서 ②분류(tier 반영)·⑤라우팅(전원)
+  if(myRole==='pos')plog((tier===1?'1단 비상':'2단 주의')+' 감지·전원 방송: "'+heard+'"','warn');
+}
+function onDanger(m){
+  if(myRole==='pos'){plog((m.tier===1?'1단 비상':'2단 주의')+' 수신: "'+m.heard+'"','warn');return;}
+  const ov=document.getElementById(myRole==='bar'?'bDangerOv':'cDangerOv');
+  if(!ov)return;
+  ov.className='dangerOv t'+m.tier;
+  ov.innerHTML=(m.tier===1
+    ?'<p class="dg1">⚠ 위험</p><p class="dg2">"'+m.heard+'"</p><p class="dg3">주변을 확인하세요 — 확인 절차 없음 · 수신 기록됨 · 핀치=닫기</p>'
+    :'<p class="dg1">주의</p><p class="dg2">"'+m.heard+'"</p><p class="dg3">6초 후 자동 복귀 · 핀치=닫기</p>');
+  dangerOpen=true;
+  vib(HUB.hierarchy(m.klass||(m.tier===1?'emergency':'safety')).vib);  // 허브 ④
+  clearTimeout(dangerTimer);
+  dangerTimer=setTimeout(hideDanger, m.tier===2?6000:10000);
+}
+function hideDanger(){
+  dangerOpen=false;clearTimeout(dangerTimer);
+  for(const id of ['bDangerOv','cDangerOv']){const o=document.getElementById(id);if(o)o.className='dangerOv hidden';}
+}
+function setupEar(){
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  const st=document.getElementById('pEarSt'), btn=document.getElementById('pEar');
+  if(!btn)return;
+  if(!SR){st.textContent='이 브라우저는 음성 인식 미지원 — 크롬에서 열어주세요';return;}
+  btn.onclick=()=>{
+    if(earOn){earOn=false;try{ear.stop();}catch(e){}st.textContent='꺼짐';btn.style.borderColor='';return;}
+    ear=new SR();ear.lang='ko-KR';ear.continuous=true;ear.interimResults=true;
+    ear.onresult=ev=>{
+      const r=ev.results[ev.results.length-1];
+      const {text}=HUB.transform(r[0].transcript);   // 허브 ① 변환
+      document.getElementById('pHeard').textContent='듣는 중: '+text.slice(-40);
+      const tier=matchDanger(text);                   // 허브 ② 분류(위험 어휘)
+      if(tier)fireDanger(tier,text.slice(-30));
+    };
+    ear.onerror=e=>{st.textContent='오류: '+e.error+' — 마이크 권한을 확인하세요';};
+    ear.onend=()=>{if(earOn){try{ear.start();}catch(e){}}};
+    try{ear.start();earOn=true;st.textContent='듣는 중 — 위험 어휘에만 반응, 일반 대화는 무시·미저장';btn.style.borderColor='#1E6B45';}
+    catch(e){st.textContent='시작 실패: '+e.message;}
+  };
+}
+setupEar();
+
+/* ═══ 시작 화면 + 진단 ═══ */
+const V={start:document.getElementById('startView'),bar:document.getElementById('barView'),
+  cs:document.getElementById('csView'),pos:document.getElementById('posView'),
+  diag:document.getElementById('diagView')};
+function startFocus(){
+  setFocusables([...V.start.querySelectorAll('.fbtn')]);
+  const sr=lsGet('hud_role');
+  if(sr){const i=focusables.findIndex(b=>b.dataset.r===sr);if(i>=0){fIdx=i;paint();}}
+}
+function enterRole(r){
+  myRole=r;lsSet('hud_role',r);
+  V.start.classList.add('hidden');
+  if(r==='pos'){
+    // 태블릿: 고정 600 뷰포트 해제
+    const vm=document.querySelector('meta[name=viewport]');
+    if(vm)vm.setAttribute('content','width=device-width, initial-scale=1.0');
+    document.body.classList.add('posmode');
+    V.pos.classList.remove('hidden');document.body.style.background='var(--paper)';setFocusables([]);
+  }
+  else if(r==='bar'){V.bar.classList.remove('hidden');barRender('waiting');}
+  else{V.cs.classList.remove('hidden');csRender('waiting');}
+  updateModeChips();
+  send({t:'hello',role:r,to:'all'});
+}
+function openDiag(){V.start.classList.add('hidden');V.diag.classList.remove('hidden');runDiag();}
+function closeDiag(){V.diag.classList.add('hidden');V.start.classList.remove('hidden');startFocus();}
+function runDiag(){
+  const dMid=document.getElementById('dMid');
+  const sOk=lsSet('_diag_t','1');
+  const mqLine=mqOK
+    ?'<span class="g">연결됨 — 안경이 외부 네트워크(wss)를 허용합니다 ✓</span>'
+    :'<span class="tag-warn">미연결 — 잠시 후 새로고침, 계속 실패하면 안경 브라우저가 외부 소켓 차단</span>';
+  dMid.innerHTML=
+    '<p class="t2">① MQTT(wss) 통신: '+mqLine+'</p>'+
+    '<p class="t2">② 마지막 입력: <span class="g" id="dKey">'+(lastKey?lastKey+' ('+lastKeyN+'회)':'아직 없음 — 스와이프해 보세요')+'</span></p>'+
+    '<p class="t2">③ 진동 API: '+(navigator.vibrate?'지원':'미지원 → <span class="g">시각 펄스로 대체 중</span>')+'</p>'+
+    '<p class="t2">④ 저장소(localStorage): '+(sOk?'작동 ✓ (역할·방 기억됨)':'<span class="tag-warn">차단됨</span>')+'</p>'+
+    '<p class="t2">⑤ 화면: '+innerWidth+'×'+innerHeight+' <span class="t3">(기대값 600×600)</span></p>'+
+    '<p class="t3">'+navigator.userAgent.slice(0,84)+'</p>'+
+    '<div class="btnrow"><button class="fbtn" id="dPulseBtn">펄스 테스트</button><button class="fbtn" id="dReBtn">다시 검사</button><button class="fbtn" id="dCloseBtn">닫기</button></div>';
+  document.getElementById('dPulseBtn').onclick=()=>pulseEl(document.getElementById('dPulseRing'),[250,120,250,120,250]);
+  document.getElementById('dReBtn').onclick=runDiag;
+  document.getElementById('dCloseBtn').onclick=closeDiag;
+  setFocusables([...dMid.querySelectorAll('.fbtn')]);
+}
+V.start.querySelectorAll('.fbtn').forEach(b=>b.onclick=()=>{
+  if(b.dataset.r==='diag')openDiag();else enterRole(b.dataset.r);
+});
+if(['bar','pos','cs'].includes(myRole))enterRole(myRole);
+else startFocus();
+
+/* ═══ BAR (EX1 + 모드 제안 카드) ═══ */
+const bTopL=document.getElementById('bTopL'),bMid=document.getElementById('bMid'),
+      bFoot=document.getElementById('bFoot'),bDefer=document.getElementById('bDefer');
+let bState='waiting',order=null,change=null,deferred=[];
+function barProposal(mode){ // 허브 ③ 하이브리드 전환: 제안은 카드로, 확정은 핀치로
+  if(HUB.mode===mode)return;
+  if(bState==='waiting')barRender('modeAsk');
+}
+function barRender(st){
+  bState=st;dblHandler=null;V.bar.classList.remove('alert');
+  let tl='',mid='',ft='';
+  if(st==='waiting'){tl='대기 · '+modeLabel(HUB.mode);
+    mid=`<p class="t1">근무 준비 완료</p><p class="t3">POS에서 주문이 오면 표시됩니다</p>`;
+    ft='스와이프=이동 · 핀치=선택';}
+  else if(st==='modeAsk'){tl='제안 · 허브';
+    mid=`<p class="t1">러시 모드로 전환할까요?</p><p class="t3">주문 유입 감지 — 급한 것만 통과되고 잡담은 보류됩니다</p>
+      <div class="btnrow"><button class="fbtn" id="bModeGo">전환</button><button class="fbtn" id="bModeNo">나중에</button></div>`;
+    ft='스와이프=이동 · <span class="g">핀치=확정</span>';}
+  else if(st==='calmAsk'){tl='제안 · 허브';
+    mid=`<p class="t1">여유 모드로 전환할까요?</p><p class="t3">${deferred.length?('보류된 잡담 '+deferred.length+'건이 도착합니다'):'알림 문턱이 낮아집니다'}</p>
+      <div class="btnrow"><button class="fbtn" id="bCalmGo">전환</button><button class="fbtn" id="bCalmNo">아직</button></div>`;
+    ft='스와이프=이동 · <span class="g">핀치=확정</span>';}
+  else if(st==='order'){tl='새 주문';
+    mid=`<p class="t1">${order.drink}</p><p class="t2">${order.opts}</p><p class="t3">주문 #${order.id}</p>
+      <div class="btnrow"><button class="fbtn" id="bAcc">제조 시작</button></div>`;
+    ft='<span class="g">핀치 → 제조 시작</span>';}
+  else if(st==='making'){tl='<span class="tag-ok">제조 중</span> · #'+order.id;
+    mid=`<p class="t1">${order.drink}</p><p class="t2">${order.opts}</p>
+      <div class="btnrow"><button class="fbtn" id="bDone">완료 보고</button></div>`;
+    ft='핀치 → 완료 보고';}
+  else if(st==='change'){V.bar.classList.add('alert');
+    tl='<span class="tag-warn">변경 · #'+order.id+'</span>';
+    mid=`<p class="strike">${change.from}</p><p class="diff">→ ${change.toV}</p><p class="t2">나머지 동일</p>`;
+    ft='<span class="g">더블 핀치 → 알겠음</span> (핀치 두 번)';
+    dblHandler=()=>{send({t:'ack',id:order.id});barRender('acked');};}
+  else if(st==='acked'){tl='<span class="tag-ok">변경 반영됨</span>';
+    mid=`<p class="okline">✓ 확인 전달됨</p><p class="t1">${order.drink}</p>
+      <p class="t2">${order.opts} · <span style="color:var(--warn)">${change.toV}</span></p>
+      <div class="btnrow"><button class="fbtn" id="bDone">완료 보고</button></div>`;
+    ft='핀치 → 완료 보고';}
+  else if(st==='done'){tl='<span class="tag-ok">완료</span>';
+    mid=`<p class="t1">#${order?order.id:''} 완료 보고됨</p><p class="t3">순환 구조가 닫혔습니다</p>`;
+    ft='다음 대기';order=null;change=null;
+    setTimeout(()=>{if(bState==='done'){
+      if(HUB.mode==='rush'||deferred.length)barRender('calmAsk');
+      else barRender('waiting');
+    }},2200);}
+  else if(st==='deferred'){const d=deferred.shift();
+    if(deferred.length){bDefer.textContent='잡담 '+deferred.length+'건 보류';}
+    else bDefer.style.display='none';
+    vib(HUB.hierarchy('chat').vib);
+    tl='대화 · 민지';
+    mid=`<div style="background:#1D2329;border-radius:12px;padding:3% 4%"><p class="t2" style="color:#D5DDE4">${d.text}</p><p class="t3">보류됐다 지금 도착</p></div>
+      <div class="btnrow"><button class="fbtn" id="bR1">고마워</button><button class="fbtn" id="bR2">너도 고생했어</button></div>`;
+    ft='스와이프=이동 · <span class="g">핀치=전송</span>';}
+  else if(st==='replied'){tl='대화 · 민지';
+    mid=`<p class="okline">✓ 답장 전송됨</p>`;ft='다음 대기';
+    setTimeout(()=>{if(bState==='replied')barRender(deferred.length?'deferred':'waiting');},2200);}
+  bTopL.innerHTML=tl;bMid.innerHTML=mid;bFoot.innerHTML=ft;
+  const acc=document.getElementById('bAcc');if(acc)acc.onclick=()=>{send({t:'accept',id:order.id});barRender('making');};
+  const dn=document.getElementById('bDone');if(dn)dn.onclick=()=>{send({t:'done',id:order.id});barRender('done');};
+  const r1=document.getElementById('bR1');if(r1)r1.onclick=()=>{send({t:'reply',text:'고마워'});barRender('replied');};
+  const r2=document.getElementById('bR2');if(r2)r2.onclick=()=>{send({t:'reply',text:'너도 고생했어'});barRender('replied');};
+  const mg=document.getElementById('bModeGo');if(mg)mg.onclick=()=>{setMode('rush',true);barRender(order?'order':'waiting');};
+  const mn=document.getElementById('bModeNo');if(mn)mn.onclick=()=>{barRender(order?'order':'waiting');};
+  const cg=document.getElementById('bCalmGo');if(cg)cg.onclick=()=>{setMode('shoulder',true);barRender(deferred.length?'deferred':'waiting');};
+  const cn=document.getElementById('bCalmNo');if(cn)cn.onclick=()=>{barRender('waiting');};
+  setFocusables([...bMid.querySelectorAll('.fbtn')]);
+}
+function barReceive(m){
+  if(m.t==='order'){order=m;send({t:'seen',what:'order',id:m.id});vib(HUB.hierarchy(m.klass||'task').vib);
+    if(bState!=='modeAsk')barRender('order');}
+  else if(m.t==='change'&&order){change=m;send({t:'seen',what:'change',id:order.id});
+    vib(HUB.hierarchy(m.klass||'change').vib);barRender('change');}
+  else if(m.t==='chat'){
+    const busy=['order','making','change','acked','modeAsk','calmAsk'].includes(bState);
+    if(HUB.gate(m.klass||'chat',{busy})==='defer'){   // 허브 게이트: 모드 문턱(+과업 중 보조 규칙)
+      deferred.push(m);bDefer.style.display='';bDefer.textContent='잡담 '+deferred.length+'건 보류';
+      send({t:'deferNote'});
+    }else{deferred.push(m);barRender('deferred');}
+  }
+}
+
+/* ═══ CS (EX2 + PC/CP) ═══ */
+const cTopL=document.getElementById('cTopL'),cMid=document.getElementById('cMid'),cFoot=document.getElementById('cFoot');
+let cState='waiting',req=null;
+const PC_CANDS={ // 어휘 세트의 답장 후보 3 (긍정·부정·유보)
+  pc1:['지금 갈게요','지금 못 가요','5분 뒤에'],
+  pc2:['바로 처리할게요','못 가요, 대신 부탁','확인했어요'],
+  pc3:['갈게요','바빠요, 다른 분 부탁','잠시 후']
+};
+function csRender(st){
+  cState=st;dblHandler=null;V.cs.classList.remove('alert');
+  let tl='',mid='',ft='';
+  if(st==='waiting'){tl='순회 중 · '+modeLabel(HUB.mode);
+    mid=`<p class="t1">플로어 체크 중</p><p class="t3">요청이 오면 위치와 함께 표시됩니다</p>
+      <div class="btnrow"><button class="fbtn" id="cCP1">CP-1 · 우유 2팩 남음 보고</button></div>`;
+    ft='<span class="g">핀치 → POS에 보고</span> · rush 중엔 허브가 보류 후 여유 때 전달';}
+  else if(st==='request'){
+    if(req.urgent)V.cs.classList.add('alert');
+    tl=(req.urgent?'<span class="tag-warn">안전 · ':'요청 · ')+req.code.toUpperCase()+(req.urgent?'</span>':'')+' · 민지(POS)';
+    mid=`<p class="t1">${req.text}</p><p class="loc">위치: ${req.loc}</p>
+      <div class="btnrow">${PC_CANDS[req.code].map((c,i)=>`<button class="fbtn" data-i="${i}">${c}</button>`).join('')}</div>`;
+    ft='스와이프=후보 이동 · <span class="g">핀치=답장</span>';}
+  else if(st==='moving'){tl='<span class="tag-ok">이동 중</span> · '+req.code.toUpperCase();
+    mid=`<p class="t1">${req.text}</p><p class="loc">→ ${req.loc}</p>
+      <div class="btnrow"><button class="fbtn" id="cArr">도착 — 처리 완료</button></div>`;
+    ft='<span class="g">처리 후 핀치 → 완료 보고</span>';}
+  else if(st==='reqDone'){tl='<span class="tag-ok">완료</span>';
+    mid=`<p class="okline">✓ ${req.text} — 완료 보고됨</p><p class="t3">순회로 복귀</p>`;
+    ft='';req=null;
+    setTimeout(()=>{if(cState==='reqDone')csRender('waiting');},2000);}
+  else if(st==='cpSent'){tl='보고 전송됨';
+    mid=`<p class="okline">✓ 우유 2팩 남음 — POS에 전달${HUB.mode==='rush'?' (러시 — 허브가 보류, 여유 때 도착)':''}</p><p class="t3">확인이 오면 표시됩니다</p>`;
+    ft='';}
+  else if(st==='cpConfirmed'){tl='보고 확인됨';
+    mid=`<p class="okline">✓ 민지가 확인 — "발주할게"</p>`;ft='';
+    setTimeout(()=>{if(cState==='cpConfirmed')csRender('waiting');},2200);}
+  cTopL.innerHTML=tl;cMid.innerHTML=mid;cFoot.innerHTML=ft;
+  const cp1=document.getElementById('cCP1');
+  if(cp1)cp1.onclick=()=>{send({t:'cp1',text:'우유 2팩 남음 — 보충 필요'});csRender('cpSent');};
+  if(st==='request'){
+    cMid.querySelectorAll('.fbtn').forEach(b=>{
+      b.onclick=()=>{
+        const i=+b.dataset.i;
+        if(i===0){send({t:'csAccept',code:req.code});csRender('moving');}
+        else if(i===1){send({t:'csDecline',code:req.code,text:PC_CANDS[req.code][1]});req=null;csRender('waiting');}
+        else{send({t:'csHold',code:req.code});} // 유보: 상태 유지
+      };
+    });
+  }
+  const arr=document.getElementById('cArr');
+  if(arr)arr.onclick=()=>{send({t:'csDone',code:req.code});csRender('reqDone');};
+  setFocusables([...cMid.querySelectorAll('.fbtn')]);
+}
+function csReceive(m){
+  if(m.t==='pc1'||m.t==='pc2'||m.t==='pc3'){
+    req={code:m.t,text:m.text,loc:m.loc,urgent:(m.klass==='safety')||m.t==='pc2'};
+    send({t:'csSeen',code:m.t});
+    vib(HUB.hierarchy(m.klass||'task').vib);   // 허브 ④ 위계 → 진동·펄스
+    csRender('request');
+  }
+  else if(m.t==='cpReceipt'){csRender('cpConfirmed');}
+}
+
+/* ═══ POS ═══ */
+const pStatus=document.getElementById('pStatus'),pLog=document.getElementById('pLog'),pInbox=document.getElementById('pInbox');
+const btn={order:document.getElementById('pOrder'),change:document.getElementById('pChange'),chat:document.getElementById('pChat'),
+  pc1:document.getElementById('pPC1'),pc2:document.getElementById('pPC2'),pc3:document.getElementById('pPC3')};
+let stg={order:-1,change:-1},csStg={}; // csStg[code] = 0전송 1도착 2수락/불가 3완료
+function plog(m,c){const li=document.createElement('li');li.textContent=m;if(c)li.className=c;pLog.prepend(li);}
+function pRender(){
+  let h='';
+  if(stg.order>=0){const L=['전송','도착','수락·제조','완료 ✓'];
+    h+=`<p style="font-size:13px;font-weight:600">BAR · 주문 #127</p><div class="stgrow">${L.map((l,i)=>`<span class="stg ${i<stg.order?'ok':(i===stg.order?(i===3?'ok':'on'):'')}">${l}</span>`).join('')}</div>`;}
+  if(stg.change>=0){const L=['전송','도착·안 봄','확인 ✓'];
+    h+=`<p style="font-size:13px;font-weight:600;margin-top:10px">BAR · 변경 우유→오트</p><div class="stgrow">${L.map((l,i)=>`<span class="stg ${i<stg.change?'ok':(i===stg.change?(i===2?'ok':'on'):'')}">${l}</span>`).join('')}</div>`;}
+  for(const code of Object.keys(csStg)){
+    const v=csStg[code];
+    const L=v.declined?['전송','도착','불가 ✗']:['전송','도착','수락·이동 중','완료 ✓'];
+    const cur=v.stage;
+    h+=`<p style="font-size:13px;font-weight:600;margin-top:10px">CS · ${v.label}</p><div class="stgrow">${L.map((l,i)=>{
+      let cls='';
+      if(v.declined&&i===2)cls=i<=cur?'no':'';
+      else cls=i<cur?'ok':(i===cur?((i===L.length-1)?'ok':'on'):'');
+      return `<span class="stg ${cls}">${l}</span>`;}).join('')}</div>`;
+    if(v.declined)h+=`<p style="font-size:12px;color:#8a3030;margin-top:4px">거절 사유: ${v.reason} — 재라우팅 필요(다른 인력·직접 처리)</p>`;
+    if(v.hold)h+=`<p style="font-size:12px;color:#8a6520;margin-top:4px">유보: 잠시 후 — 큐에 남음</p>`;
+  }
+  pStatus.innerHTML=h||'<p style="font-size:13px;color:var(--ink-soft)">아직 보낸 것 없음</p>';
+}
+const PC_DEF={pc1:{text:'3번 테이블 정리 부탁',loc:'3번 테이블',label:'PC-1 테이블 정리'},
+  pc2:{text:'입구 음료 쏟음 — 미끄럼 주의',loc:'입구',label:'PC-2 쏟음(안전)'},
+  pc3:{text:'라이더 도착 — 픽업대 응대',loc:'픽업대',label:'PC-3 라이더'}};
+btn.order.onclick=()=>{
+  if(HUB.mode!=='rush'){send({t:'modeProposal',mode:'rush'});plog('허브: 주문 유입 감지 → 러시 전환 제안 (BAR 핀치로 확정)','warn');}
+  send({t:'order',id:127,drink:'아이스 라떼',opts:'톨 · 샷 추가 · 얼음 적게'});
+  stg.order=0;pRender();btn.order.disabled=true;btn.change.disabled=false;plog('주문 전송 → BAR (허브 ⑤ 라우팅 자동)');};
+btn.change.onclick=()=>{send({t:'change',from:'일반 우유',toV:'오트 우유'});stg.change=0;pRender();btn.change.disabled=true;plog('변경 전송 → BAR · 허브 ② 급함 통과 · ④ 강한 진동','warn');};
+btn.chat.onclick=()=>{send({t:'chat',text:'아까 진짜 잘했어'});plog('잡담 전송 → BAR · 허브 게이트 판정 대상');};
+for(const code of ['pc1','pc2','pc3']){
+  btn[code].onclick=()=>{
+    const d=PC_DEF[code];
+    send({t:code,text:d.text,loc:d.loc});
+    csStg[code]={stage:0,label:d.label};pRender();
+    plog(d.label+' 전송 → CS (허브 ⑤ 라우팅 자동)'+(code==='pc2'?' · ④ 안전 위계':''),code==='pc2'?'warn':null);
+  };
+}
+function showInbox(m){
+  const empty=pInbox.querySelector('p.empty');if(empty)empty.remove();
+  const d=document.createElement('div');d.className='inbox';
+  d.innerHTML=`<p class="who">CP-1 · CS(준호) → POS${m.held?' · 러시 중 보류됐다 지금 도착':''}</p><p class="what">${m.text}</p><button>확인 — 발주할게</button>`;
+  d.querySelector('button').onclick=()=>{
+    send({t:'cpReceipt'});d.remove();
+    if(!pInbox.querySelector('.inbox'))pInbox.innerHTML='<p class="empty" style="font-size:13px;color:var(--ink-soft)">도착한 보고 없음</p>';
+    plog('CP-1 확인 전송 → CS','ok');
+  };
+  pInbox.appendChild(d);
+  plog('CS 보고 도착: '+m.text,'warn');
+}
+function flushHeld(){ // 여유 전환 → 허브가 보류했던 보고 도착
+  while(heldReports.length){const m=heldReports.shift();m.held=true;showInbox(m);}
+  updateModeChips();
+}
+function posReceive(m){
+  if(m.t==='seen'&&m.what==='order'){stg.order=Math.max(stg.order,1);pRender();plog('BAR: 주문 도착');}
+  else if(m.t==='accept'){stg.order=2;pRender();plog('BAR 수락 — 제조 시작','ok');}
+  else if(m.t==='seen'&&m.what==='change'){stg.change=Math.max(stg.change,1);pRender();plog('BAR: 변경 도착 — 아직 안 봄','warn');}
+  else if(m.t==='ack'){stg.change=2;pRender();plog('BAR 확인 (더블 핀치)','ok');}
+  else if(m.t==='done'){stg.order=3;pRender();btn.order.disabled=false;btn.change.disabled=true;plog('BAR 완료 — 순환 닫힘','ok');}
+  else if(m.t==='deferNote'){plog('잡담이 허브 게이트에서 보류됨 (러시/과업 중)','warn');}
+  else if(m.t==='reply'){plog('BAR 답장: "'+m.text+'"','ok');}
+  else if(m.t==='csSeen'&&csStg[m.code]){csStg[m.code].stage=1;pRender();plog('CS: '+PC_DEF[m.code].label+' 도착');}
+  else if(m.t==='csAccept'&&csStg[m.code]){csStg[m.code].stage=2;pRender();plog('CS 수락 — 이동 중','ok');}
+  else if(m.t==='csDecline'&&csStg[m.code]){csStg[m.code].stage=2;csStg[m.code].declined=true;csStg[m.code].reason=m.text;pRender();plog('CS 불가: "'+m.text+'" — 재라우팅 필요','warn');}
+  else if(m.t==='csHold'&&csStg[m.code]){csStg[m.code].hold=true;pRender();plog('CS 유보: 잠시 후','warn');}
+  else if(m.t==='csDone'&&csStg[m.code]){csStg[m.code].stage=3;csStg[m.code].hold=false;pRender();plog('CS 완료 보고 — 순환 닫힘','ok');}
+  else if(m.t==='cp1'){
+    if(HUB.gate(m.klass||'report')==='defer'){    // 허브 게이트: CS→POS 보고는 rush 중 보류 가능
+      heldReports.push(m);updateModeChips();
+      plog('허브: CS 보고 보류 (러시 중) — 여유 전환 시 도착','warn');
+    }else showInbox(m);
+  }
+  else if(m.t==='hello'){plog(m.role.toUpperCase()+' 접속됨','ok');}
+}
+updateModeChips();
+</script>
+</body>
+</html>
